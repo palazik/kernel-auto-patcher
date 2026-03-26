@@ -1,41 +1,64 @@
-name: Auto-Patch SuSFS to Kernel
+name: 1. Auto-Patch Kernel (WildKSU + SuSFS)
 
 on:
   workflow_dispatch:
 
 jobs:
-  apply-patch:
+  patch-and-push:
     runs-on: ubuntu-latest
     steps:
+      - name: Install dependencies & Wiggle
+        run: sudo apt update && sudo apt install -y wiggle
+
       - name: Setup Git
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Clone your Kernel
+      - name: Clone Kernel Source
         run: |
-          # Клонируем твое ядро, используя токен для доступа
+          # Клонируем твое ядро с помощью токена
           git clone https://${{ secrets.PAT_TOKEN }}@github.com/palazik/kernel_xiaomi_mars.git -b twelve kernel_repo
 
       - name: Clone SuSFS
         run: |
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-5.4 susfs_repo
 
-      - name: Apply Patch and Capture Conflicts
+      - name: Apply Patches & Fix Conflicts
         working-directory: kernel_repo
         run: |
-          # Пытаемся наложить патч. 
-          # Ставим || true, чтобы экшен не остановился при появлении конфликтов
-          patch -p1 < ../susfs_repo/kernel_patches/50_add_susfs_in_kernel-5.4.patch || true
-
-      - name: Push results to new branch
-        working-directory: kernel_repo
-        run: |
-          # Создаем новую ветку для грязного патча
-          git checkout -b susfs-test-branch
-          git add .
-          # Коммитим всё, включая сгенерированные .rej файлы
-          git commit -m "Auto-applied SuSFS patch (contains .rej conflicts)" || echo "No changes to commit"
-          # Пушим обратно в твой репозиторий
-          git push -u origin susfs-test-branch
+          set -x
+          # 1. Установка WildKSU
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/refs/heads/stable/kernel/setup.sh" | bash -s stable
           
+          # 2. Патчим WildKSU
+          cd Wild_KSU/
+          patch -p1 < ../../susfs_repo/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
+          cd ..
+          
+          # 3. Накладываем патч на ядро
+          patch -p1 < ../susfs_repo/kernel_patches/50_add_susfs_in_kernel-5.4.patch || true
+          
+          # 4. Вживляем конфликты (магия Wiggle)
+          find . -name "*.rej" -type f | while read rej_file; do
+            target_file="${rej_file%.rej}"
+            wiggle --replace "$target_file" "$rej_file" || true
+            rm -f "$rej_file"
+          done
+          
+          # 5. Копируем файлы SuSFS
+          cp -v ../susfs_repo/kernel_patches/fs/susfs.c fs/
+          cp -v ../susfs_repo/kernel_patches/include/linux/susfs.h include/linux/
+          cp -v ../susfs_repo/kernel_patches/include/linux/susfs_def.h include/linux/
+          
+          if ! grep -q "susfs.o" fs/Makefile; then
+             echo "obj-y += susfs.o" >> fs/Makefile
+          fi
+
+      - name: Push to new branch
+        working-directory: kernel_repo
+        run: |
+          git checkout -b twelve-patched
+          git add .
+          git commit -m "Auto-integrated WildKSU & SuSFS via Wiggle" || echo "No changes"
+          git push -f -u origin twelve-patched
